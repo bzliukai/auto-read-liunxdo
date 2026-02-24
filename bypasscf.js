@@ -548,6 +548,8 @@ async function launchBrowserForUser(username, password) {
   }
 }
 
+// 只替换 login 函数（从第 534 行开始）
+
 async function login(page, username, password, retryCount = 3) {
   try {
     // ✅ 检查 frame 是否已分离
@@ -555,7 +557,7 @@ async function login(page, username, password, retryCount = 3) {
     if (!frame || frame.isDetached()) {
       console.error('⚠️ Frame已分离，重试登录...');
       if (retryCount > 0) {
-        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
         await new Promise(r => setTimeout(r, 2000));
         return await login(page, username, password, retryCount - 1);
       } else {
@@ -569,7 +571,7 @@ async function login(page, username, password, retryCount = 3) {
         (button) =>
           button.textContent.includes("登录") ||
           button.textContent.includes("login")
-      ); // 注意loginButton 变量在外部作用域中是无法被 page.evaluate 内部的代码直接修改的。page.evaluate 的代码是在浏览器环境中执行的，这意味着它们无法直接影响 Node.js 环境中的变量
+      );
       // 如果没有找到，尝试根据类名查找
       if (!loginButton) {
         loginButton = document.querySelector(".login-button");
@@ -577,12 +579,20 @@ async function login(page, username, password, retryCount = 3) {
       if (loginButton) {
         loginButton.click();
         console.log("Login button clicked.");
-        return true; // 返回true表示找到了按钮并点击了
+        return true;
       } else {
         console.log("Login button not found.");
-        return false; // 返回false表示没有找到按钮
+        return false;
       }
+    }).catch((err) => {
+      // ✅ 捕获 detached frame 错误
+      if (err.message.includes('detached Frame') || err.message.includes('Execution context')) {
+        console.warn('⚠️ 页面context丢失，将重新加载后重试');
+        throw new Error('FRAME_DETACHED');
+      }
+      throw err;
     });
+
     if (!loginButtonFound) {
       if (loginUrl == "https://meta.appinn.net") {
         await page.goto("https://meta.appinn.net/t/topic/52006", {
@@ -602,42 +612,49 @@ async function login(page, username, password, retryCount = 3) {
         }
       }
     }
+
     // 等待用户名输入框加载
-    await page.waitForSelector("#login-account-name");
-    // 模拟人类在找到输入框后的短暂停顿
-    await delayClick(1000); // 延迟500毫秒
+    await page.waitForSelector("#login-account-name", { timeout: 20000 });
+    await delayClick(1000);
+    
     // 清空输入框并输入用户名
     await page.click("#login-account-name", { clickCount: 3 });
-    await page.type("#login-account-name", username, {
-      delay: 100,
-    }); // 输入时在每个按键之间添加额外的延迟
+    await page.type("#login-account-name", username, { delay: 100 });
     await delayClick(1000);
-    // 等待密码输入框加载
-    // await page.waitForSelector("#login-account-password");
-    // 模拟人类在输入用户名后的短暂停顿
-    // delayClick; // 清空输入框并输入密码
+    
+    // 输入密码
     await page.click("#login-account-password", { clickCount: 3 });
-    await page.type("#login-account-password", password, {
-      delay: 100,
-    });
-
-    // 模拟人类在输入完成后思考的短暂停顿
+    await page.type("#login-account-password", password, { delay: 100 });
     await delayClick(1000);
 
-    // 假设登录按钮的ID是'login-button'，点击登录按钮
-    await page.waitForSelector("#login-button");
-    await delayClick(1000); // 模拟在点击登录按钮前的短暂停顿
-    await page.click("#login-button");
-    try {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: "domcontentloaded" }), // 等待 页面跳转 DOMContentLoaded 事件
-        // 去掉上面一行会报错：Error: Execution context was destroyed, most likely because of a navigation. 可能是因为之后没等页面加载完成就执行了脚本
-        page.click("#login-button", { force: true }), // 点击登录按钮触发跳转
-      ]); //注意如果登录失败，这里会一直等待跳转，导致脚本执行失败 这点四个月之前你就发现了结果今天又遇到（有个用户遇到了https://linux.do/t/topic/169209/82），但是你没有在这个报错你提示我8.5
-    } catch (error) {
+    // 点击登录按钮
+    await page.waitForSelector("#login-button", { timeout: 20000 });
+    await delayClick(1000);
+    
+    // ✅ 使用 Promise.race 替代 Promise.all，添加超时保护
+    await Promise.race([
+      Promise.all([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }),
+        page.click("#login-button", { force: true }),
+      ]),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('登录导航超时')), 40000)
+      )
+    ]).catch(async (error) => {
+      // ✅ 检查是否是 detached frame 错误
+      if (error.message.includes('detached') || error.message.includes('Execution context')) {
+        console.warn('⚠️ Frame分离错误，正在重试...');
+        if (retryCount > 0) {
+          await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+          await new Promise(r => setTimeout(r, 2000));
+          return await login(page, username, password, retryCount - 1);
+        }
+      }
+
+      // 检查密码是否错误
       const alertError = await page.$(".alert.alert-error");
       if (alertError) {
-        const alertText = await page.evaluate((el) => el.innerText, alertError); // 使用 evaluate 获取 innerText
+        const alertText = await page.evaluate((el) => el.innerText, alertError);
         if (
           alertText.includes("incorrect") ||
           alertText.includes("Incorrect ") ||
@@ -652,24 +669,31 @@ async function login(page, username, password, retryCount = 3) {
           );
         }
       } else {
+        // 如果还有重试机会，继续重试
         if (retryCount > 0) {
-          console.log("🔄 Retrying login...");
-          await page.reload({ waitUntil: "domcontentloaded", timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10) });
-          await delayClick(2000); // 增加重试前的延迟
+          console.log(`🔄 登录失败，正在重试 (${3 - retryCount + 1}/3)...`);
+          await page.reload({ 
+            waitUntil: "domcontentloaded", 
+            timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10) 
+          });
+          await delayClick(2000);
           return await login(page, username, password, retryCount - 1);
         } else {
           throw new Error(
-            `Navigation timed out in login.超时了,可能是IP质量问题,失败用户 ${username}, 
-        ${error}`
-          ); //{password}
+            `Navigation timed out in login. 超时了,可能是IP质量问题,失败用户 ${username}, ${error.message}`
+          );
         }
       }
-    }
+    });
+
     await delayClick(1000);
+    console.log(`✅ ${username} 登录完成`);
+
   } catch (error) {
-    if (error.message.includes('detached Frame') && retryCount > 0) {
-      console.warn(`⚠️ Frame detached，重试登录... (剩余 ${retryCount} 次)`);
-      await page.reload({ waitUntil: 'domcontentloaded' });
+    // ✅ 最后一层 catch：捕获所有 detached frame 错误
+    if ((error.message.includes('detached') || error.message.includes('Execution context') || error.message.includes('FRAME_DETACHED')) && retryCount > 0) {
+      console.warn(`⚠️ Frame分离错误，自动重试 (${3 - retryCount + 1}/3)...`);
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await new Promise(r => setTimeout(r, 2000));
       return await login(page, username, password, retryCount - 1);
     }
